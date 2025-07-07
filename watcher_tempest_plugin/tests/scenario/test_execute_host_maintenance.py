@@ -15,9 +15,9 @@
 # limitations under the License.
 
 from oslo_log import log
+from tempest.common import waiters
 from tempest import config
 from tempest.lib import decorators
-
 from watcher_tempest_plugin.tests.scenario import base
 
 CONF = config.CONF
@@ -109,3 +109,218 @@ class TestExecuteHostMaintenanceStrategy(base.BaseInfraOptimScenarioTest):
         # Make sure servers are migrated to backup node
         for server in instances:
             self.assertEqual(self.get_host_for_server(server['id']), dst_node)
+
+    @decorators.idempotent_id('a1b2c3d4-e5f6-7890-ab12-cd34ef567890')
+    @decorators.attr(type=['strategy', 'host_maintenance'])
+    def test_execute_host_maintenance_disable_live_migration(self):
+        # This test verifies that when live migration is disabled,
+        # active instances are cold migrated to other nodes
+
+        self.addCleanup(self.rollback_compute_nodes_status)
+        self.addCleanup(self.wait_delete_instances_from_model)
+        instances = self._create_one_instance_per_host()
+        # wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        src_node = self.get_host_for_server(instances[0]['id'])
+        # Store initial host locations
+        initial_hosts = {
+            instance['id']: self.get_host_for_server(instance['id'])
+            for instance in instances
+        }
+
+        goal_name = "cluster_maintaining"
+        strategy_name = "host_maintenance"
+        audit_kwargs = {
+            "parameters": {
+                "maintenance_node": src_node,
+                "disable_live_migration": True
+            }
+        }
+        self.execute_strategy(goal_name, strategy_name,
+                              expected_actions=['change_nova_service_state',
+                                                'migrate'],
+                              **audit_kwargs)
+
+        # Verify instances are (cold) migrated to different nodes
+        for instance in instances:
+            if initial_hosts[instance['id']] == src_node:
+                new_host = self.get_host_for_server(instance['id'])
+                self.assertNotEqual(
+                    initial_hosts[instance['id']], new_host)
+                # Verify instance is active after cold migration
+                server = self.mgr.servers_client.show_server(
+                    instance['id'])['server']
+                self.assertEqual('ACTIVE', server['status'])
+
+    @decorators.idempotent_id('053025b9-acdf-4bf5-b3c3-a132396a2de4')
+    @decorators.attr(type=['strategy', 'host_maintenance'])
+    def test_execute_host_maintenance_disable_cold_migration(self):
+        # This test verifies that when cold migration is disabled,
+        # active instances are live migrated (cold migration disabled
+        # doesn't affect active instances)
+
+        self.addCleanup(self.rollback_compute_nodes_status)
+        self.addCleanup(self.wait_delete_instances_from_model)
+        instances = self._create_one_instance_per_host()
+        # wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        src_node = self.get_host_for_server(instances[0]['id'])
+
+        goal_name = "cluster_maintaining"
+        strategy_name = "host_maintenance"
+        audit_kwargs = {
+            "parameters": {
+                "maintenance_node": src_node,
+                "disable_cold_migration": True
+            }
+        }
+        self.execute_strategy(goal_name, strategy_name,
+                              expected_actions=['change_nova_service_state',
+                                                'migrate'],
+                              **audit_kwargs)
+
+    @decorators.idempotent_id('31b8523e-2f5b-4002-a3cf-678fbc215f0b')
+    @decorators.attr(type=['strategy', 'host_maintenance'])
+    def test_exec_host_maintenance_disable_cold_inactive_instances(self):
+        # This test verifies that when cold migration is disabled,
+        # inactive instances are unaffected.
+
+        self.addCleanup(self.rollback_compute_nodes_status)
+        self.addCleanup(self.wait_delete_instances_from_model)
+        instances = self._create_one_instance_per_host()
+        # wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        src_node = self.get_host_for_server(instances[0]['id'])
+
+        # Create inactive instances by pausing some instances
+        inactive_instances = []
+        for instance in instances:
+            if self.get_host_for_server(instance['id']) == src_node:
+                # Stop the instance to make it inactive
+                self.mgr.servers_client.pause_server(instance['id'])
+                # Wait for the instance to be paused
+                waiters.wait_for_server_status(
+                    self.mgr.servers_client, instance['id'], 'PAUSED'
+                )
+                inactive_instances.append(instance)
+
+        # Wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        goal_name = "cluster_maintaining"
+        strategy_name = "host_maintenance"
+        audit_kwargs = {
+            "parameters": {
+                "maintenance_node": src_node,
+                "disable_cold_migration": True
+            }
+        }
+
+        # No migrations should occur, only change_nova_service_state
+        self.execute_strategy(goal_name, strategy_name,
+                              expected_actions=['change_nova_service_state'],
+                              **audit_kwargs)
+
+        # Verify inactive instances remain on the same host and stay paused
+        for instance in inactive_instances:
+            current_host = self.get_host_for_server(instance['id'])
+            self.assertEqual(current_host, src_node)
+            server = self.mgr.servers_client.show_server(
+                instance['id'])['server']
+            self.assertEqual('PAUSED', server['status'])
+
+    @decorators.idempotent_id('863b16b5-3c74-413c-98a8-d9ce5deb539c')
+    @decorators.attr(type=['strategy', 'host_maintenance'])
+    def test_execute_host_maintenance_disable_both_migrations(self):
+        # This test verifies that when both migrations are disabled,
+        # active instances are stopped instead of migrated
+
+        self.addCleanup(self.rollback_compute_nodes_status)
+        self.addCleanup(self.wait_delete_instances_from_model)
+        instances = self._create_one_instance_per_host()
+        # wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        src_node = self.get_host_for_server(instances[0]['id'])
+
+        goal_name = "cluster_maintaining"
+        strategy_name = "host_maintenance"
+        audit_kwargs = {
+            "parameters": {
+                "maintenance_node": src_node,
+                "disable_live_migration": True,
+                "disable_cold_migration": True
+            }
+        }
+        self.execute_strategy(goal_name, strategy_name,
+                              expected_actions=['change_nova_service_state',
+                                                'stop'],
+                              **audit_kwargs)
+
+        # Wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        # Verify instances on maintenance node are stopped
+        for instance in instances:
+            current_host = self.get_host_for_server(instance['id'])
+            if current_host == src_node:
+                server = self.mgr.servers_client.show_server(
+                    instance['id'])['server']
+                self.assertEqual('SHUTOFF', server['status'])
+                # Verify instance remains on the same host (not migrated)
+                self.assertEqual(current_host, src_node)
+
+    @decorators.idempotent_id('f5e6d7c8-1234-5678-9012-ab34cd56ef78')
+    @decorators.attr(type=['strategy', 'host_maintenance'])
+    def test_exec_host_maintenance_disable_migration_inactive_instances(self):
+        # This test creates inactive instances to verify that when both
+        # migrations are disabled, only change_nova_service_state occurs
+
+        self.addCleanup(self.rollback_compute_nodes_status)
+        self.addCleanup(self.wait_delete_instances_from_model)
+        instances = self._create_one_instance_per_host()
+        # wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        src_node = self.get_host_for_server(instances[0]['id'])
+
+        # Create inactive instances by stopping some instances
+        inactive_instances = []
+        for instance in instances:
+            if self.get_host_for_server(instance['id']) == src_node:
+                # Stop the instance to make it inactive
+                self.mgr.servers_client.stop_server(instance['id'])
+                # Wait for the instance to be stopped
+                waiters.wait_for_server_status(
+                    self.mgr.servers_client, instance['id'], 'SHUTOFF'
+                )
+                inactive_instances.append(instance)
+
+        # Wait for compute model updates
+        self.wait_for_instances_in_model(instances)
+
+        goal_name = "cluster_maintaining"
+        strategy_name = "host_maintenance"
+        audit_kwargs = {
+            "parameters": {
+                "maintenance_node": src_node,
+                "disable_live_migration": True,
+                "disable_cold_migration": True
+            }
+        }
+
+        # No migrations should occur, only change_nova_service_state
+        self.execute_strategy(goal_name, strategy_name,
+                              expected_actions=['change_nova_service_state'],
+                              **audit_kwargs)
+
+        # Verify inactive instances remain on the same host and stay stopped
+        for instance in inactive_instances:
+            current_host = self.get_host_for_server(instance['id'])
+            self.assertEqual(current_host, src_node)
+            server = self.mgr.servers_client.show_server(
+                instance['id'])['server']
+            self.assertEqual('SHUTOFF', server['status'])
